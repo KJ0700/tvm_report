@@ -18,23 +18,6 @@ import re
 
 warnings.filterwarnings('ignore')
 
-# Load intent mapping
-try:
-    with open('intent_mapping.json', 'r') as f:
-        INTENT_MAPPING = json.load(f)
-except FileNotFoundError:
-    INTENT_MAPPING = {}
-    st.warning("⚠️ intent_mapping.json not found. Showing intent codes instead of descriptions.")
-
-def get_intent_display_name(intent_code):
-    """Get display name for intent code, fallback to code if not found. Case-insensitive lookup."""
-    if not intent_code:
-        return intent_code
-    # Try exact match first, then uppercase
-    if intent_code in INTENT_MAPPING:
-        return INTENT_MAPPING[intent_code]
-    return INTENT_MAPPING.get(intent_code.upper(), intent_code)
-
 # Optional imports for topic modeling
 try:
     from bertopic import BERTopic
@@ -65,6 +48,21 @@ for category, intents in INTENT_CATEGORIES.items():
     for intent in intents:
         INTENT_TO_CATEGORY[intent] = category
 
+# Load intent display name mapping from JSON
+try:
+    with open('intent_mapping.json', 'r') as f:
+        INTENT_DISPLAY_NAMES = json.load(f)
+except FileNotFoundError:
+    INTENT_DISPLAY_NAMES = {}
+
+
+def get_intent_display_name(code):
+    """Map intent code to display name, e.g. 'BV' -> 'Buy A Vehicle (BV)'"""
+    name = INTENT_DISPLAY_NAMES.get(code)
+    if name:
+        return f"{name} ({code})"
+    return code
+
 
 class AIPerformanceAnalyzer:
     """Analyzes AI chatbot performance with focus on accuracy and reliability"""
@@ -76,11 +74,21 @@ class AIPerformanceAnalyzer:
         
     def _preprocess_data(self):
         """Preprocess and clean data"""
-        # Normalize intent names to uppercase for consistent grouping (FAQ = faq)
-        self.df['intentName'] = self.df['intentName'].str.upper()
+        # Create intent_code for categorization (uppercase code)
+        # v2.1 has intentCode='BV' + intentName='Calculate Payment'
+        # v2.0 has intentName='BV' only (no intentCode column)
+        if 'intentCode' in self.df.columns:
+            self.df['intent_code'] = self.df['intentCode'].fillna(self.df['intentName']).str.upper()
+        else:
+            self.df['intent_code'] = self.df['intentName'].str.upper()
         
-        # Parse JSON responses
-        self.df['parsed_response'] = self.df['aiResponse_json'].apply(self._parse_json)
+        # Parse JSON responses (handle both aiResponseJson and aiResponse_json column names)
+        if 'aiResponseJson' in self.df.columns:
+            self.df['parsed_response'] = self.df['aiResponseJson'].apply(self._parse_json)
+        elif 'aiResponse_json' in self.df.columns:
+            self.df['parsed_response'] = self.df['aiResponse_json'].apply(self._parse_json)
+        else:
+            self.df['parsed_response'] = pd.Series([{}] * len(self.df))
         self.df['dateCreatedUtc'] = pd.to_datetime(self.df['dateCreatedUtc'])
         
         # Convert UTC to EST
@@ -101,8 +109,8 @@ class AIPerformanceAnalyzer:
         )
         self.df['entity_count'] = self.df['parsed_response'].apply(self._count_entities)
         
-        # Categorize intents
-        self.df['intent_category'] = self.df['intentName'].apply(
+        # Categorize intents using intent_code
+        self.df['intent_category'] = self.df['intent_code'].apply(
             lambda x: INTENT_TO_CATEGORY.get(x, 'Unknown')
         )
         self.df['is_actionable'] = self.df['intent_category'] == 'Actionable'
@@ -111,7 +119,7 @@ class AIPerformanceAnalyzer:
         # Check if promptName column exists
         if 'promptName' in self.df.columns:
             self.df['is_valid_interaction'] = ~(
-                (self.df['intentName'].str.upper().str.contains('IR', na=False)) & 
+                (self.df['intent_code'].str.contains('IR', na=False)) & 
                 (
                     self.df['promptName'].str.lower().str.contains('initial', na=False) | 
                     self.df['promptName'].str.lower().str.contains('faq', na=False)
@@ -178,8 +186,8 @@ class AIPerformanceAnalyzer:
         # Use valid interactions for analysis
         valid_df = self.df[self.df['is_valid_interaction']]
         
-        # Overall intent stats
-        intent_stats = valid_df.groupby('intentName').agg({
+        # Overall intent stats (group by intent_code for consistent v2.0/v2.1 handling)
+        intent_stats = valid_df.groupby('intent_code').agg({
             'sessionId': 'count'
         }).round(2)
         
@@ -207,9 +215,10 @@ class AIPerformanceAnalyzer:
         valid_df = self.df[self.df['is_valid_interaction']]
         
         # Intent-level extraction with multiple information categories
+        # Group by intent_code for consistent v2.0/v2.1 handling
         intent_summary = []
-        for intent in valid_df['intentName'].unique():
-            intent_df = valid_df[valid_df['intentName'] == intent]
+        for intent in valid_df['intent_code'].unique():
+            intent_df = valid_df[valid_df['intent_code'] == intent]
             if len(intent_df) > 0:
                 # Check for different types of information
                 current_vehicle_count = 0
@@ -408,8 +417,8 @@ class AIPerformanceAnalyzer:
         # Use filtered valid interactions (excluding IR+initial and IR+FAQ)
         valid_df = _self.df[_self.df['is_valid_interaction']]
         
-        # Filter data for the specific intent (case-insensitive)
-        intent_df = valid_df[valid_df['intentName'].str.upper() == intent_name.upper()].copy()
+        # Filter data for the specific intent using intent_code (handles both v2.0 and v2.1)
+        intent_df = valid_df[valid_df['intent_code'] == intent_name.upper()].copy()
         
         if len(intent_df) < min_docs:
             return {
@@ -819,25 +828,47 @@ def main():
     # Sidebar for file upload (always visible)
     st.sidebar.header("📁 Data Upload")
     uploaded_file = st.sidebar.file_uploader(
-        "Upload CSV file",
-        type=['csv'],
-        help="Upload your AI chatbot interaction data"
+        "Upload data file",
+        type=['json', 'csv'],
+        help="Upload your AI chatbot interaction data (JSONL or CSV)"
     )
     
     if uploaded_file is None:
-        st.info("👆 Please upload a CSV file to begin analysis")
+        st.info("👆 Please upload a JSON or CSV file to begin analysis")
         st.markdown("""
-        **Expected CSV columns:**
+        **Expected columns:**
         - `sessionId`, `dealerId`, `intentName`, `userMessage`
-        - `aiResponse_json`, `latencyMs`, `pricePerCall`
+        - `aiResponseJson`, `latencyMs`, `pricePerCall`
         - `inputTokenCount`, `outputTokenCount`, `dateCreatedUtc`
         """)
         return
     
     # Load data
     try:
-        df = pd.read_csv(uploaded_file)
+        file_name = uploaded_file.name.lower()
+        if file_name.endswith('.json'):
+            df = pd.read_json(uploaded_file, lines=True)
+        else:
+            df = pd.read_csv(uploaded_file)
+        
+        # Convert numeric string columns to proper types
+        numeric_cols = ['inputTokenCount', 'outputTokenCount', 'pricePerCall', 'latencyMs']
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
         st.sidebar.success(f"✅ Loaded {len(df)} records")
+        
+        # Offer CSV download when a JSON file is uploaded
+        if file_name.endswith('.json'):
+            csv_data = df.to_csv(index=False).encode('utf-8')
+            csv_filename = uploaded_file.name.rsplit('.', 1)[0] + '.csv'
+            st.sidebar.download_button(
+                label="⬇️ Download as CSV",
+                data=csv_data,
+                file_name=csv_filename,
+                mime='text/csv'
+            )
         
         # Load dealer details
         try:
@@ -918,6 +949,57 @@ def main():
         
         if len(df) == 0:
             st.warning("⚠️ No data found for selected dealer(s)")
+            return
+    
+    # Date filter in sidebar
+    st.sidebar.markdown("---")
+    st.sidebar.header("📅 Date Filter")
+    
+    # Parse dates for filter range
+    temp_dates = pd.to_datetime(df['dateCreatedUtc'])
+    if temp_dates.dt.tz is None:
+        temp_dates = temp_dates.dt.tz_localize('UTC')
+    temp_dates_est = temp_dates.dt.tz_convert('US/Eastern')
+    
+    min_date = temp_dates_est.min().date()
+    max_date = temp_dates_est.max().date()
+    
+    date_range = st.sidebar.date_input(
+        "Select date range (EST)",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+        key="date_filter"
+    )
+    
+    # Apply date filter if a valid range is selected
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_date, end_date = date_range
+        # Filter using EST dates
+        mask = (temp_dates_est.dt.date >= start_date) & (temp_dates_est.dt.date <= end_date)
+        df = df[mask.values]
+        st.sidebar.info(f"📅 {len(df)} records in selected range")
+    
+    if len(df) == 0:
+        st.warning("⚠️ No data found for the selected date range")
+        return
+    
+    # Version filter in sidebar
+    if 'flowVersion' in df.columns:
+        st.sidebar.header("🔄 Version Filter")
+        available_versions = sorted(df['flowVersion'].dropna().unique().tolist())
+        selected_versions = st.sidebar.multiselect(
+            "Select flow version(s)",
+            options=available_versions,
+            default=available_versions,
+            key="version_filter"
+        )
+        if selected_versions:
+            df = df[df['flowVersion'].isin(selected_versions)]
+            st.sidebar.info(f"🔄 {len(df)} records for {', '.join(selected_versions)}")
+        
+        if len(df) == 0:
+            st.warning("⚠️ No data found for the selected version(s)")
             return
     
     analyzer = AIPerformanceAnalyzer(df)
