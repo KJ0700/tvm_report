@@ -98,7 +98,7 @@ class AIPerformanceAnalyzer:
             self.df['dateCreatedUtc'] = self.df['dateCreatedUtc'].dt.tz_localize('UTC')
         
         # Convert to Eastern Time
-        self.df['dateCreatedEst'] = self.df['dateCreatedUtc'].dt.tz_convert('US/Eastern')
+        self.df['dateCreatedEst'] = self.df['dateCreatedUtc'].dt.tz_convert('America/New_York')
         
         # Extract features
         self.df['intentDescription'] = self.df['parsed_response'].apply(
@@ -959,7 +959,7 @@ def main():
     temp_dates = pd.to_datetime(df['dateCreatedUtc'])
     if temp_dates.dt.tz is None:
         temp_dates = temp_dates.dt.tz_localize('UTC')
-    temp_dates_est = temp_dates.dt.tz_convert('US/Eastern')
+    temp_dates_est = temp_dates.dt.tz_convert('America/New_York')
     
     min_date = temp_dates_est.min().date()
     max_date = temp_dates_est.max().date()
